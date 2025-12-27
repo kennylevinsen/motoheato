@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_pm.h"
 #include "esp_rom_crc.h"
+#include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -20,8 +21,10 @@
 #include "onewire_bus.h"
 
 // NimBLE BLE Headers
+#include "esp_bt.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
+#include "nimble/ble.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "services/gap/ble_svc_gap.h"
@@ -95,7 +98,6 @@ struct device_config {
 static struct device_config g_config;
 
 enum system_state {
-	STATE_BOOT,
 	STATE_WAIT_START_COND,
 	STATE_PREHEAT,
 	STATE_RUNNING,
@@ -112,8 +114,8 @@ struct app_state {
 	int64_t state_entry_time;
 };
 
-static struct app_state g_state = {.state = STATE_BOOT,
-				   .previous_state = STATE_BOOT,
+static struct app_state g_state = {.state = STATE_WAIT_START_COND,
+				   .previous_state = STATE_WAIT_START_COND,
 				   .voltage = 0.0f,
 				   .temperature = 25.0f, // Safe default
 				   .oil_pressure_ok = false,
@@ -139,6 +141,7 @@ static uint16_t g_ble_conn_handle = 0;
 static bool g_ble_connected = false;
 static uint16_t g_monitor_val_handle;
 static TaskHandle_t g_ble_mon_task_handle = NULL;
+static TaskHandle_t g_state_task_handle = NULL;
 
 // --- Helpers ---
 
@@ -269,14 +272,8 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
 };
 
 static void ble_monitor_task(void *pvParameters) {
-	ESP_LOGI(TAG, "BLE Monitor Task started");
 	while (1) {
 		ble_send_notification();
-		ESP_LOGI(TAG, "S: %d | O: %d | V: %.2f | T: %.2f | PWM: %lu/%lu/%lu", g_state.state,
-			 g_state.oil_pressure_ok, g_state.voltage, g_state.temperature,
-			 ledc_get_duty(LEDC_MODE, LEDC_CHANNEL_GRIP_L),
-			 ledc_get_duty(LEDC_MODE, LEDC_CHANNEL_GRIP_R),
-			 ledc_get_duty(LEDC_MODE, LEDC_CHANNEL_SEAT));
 		vTaskDelay(pdMS_TO_TICKS(1000));
 	}
 }
@@ -295,12 +292,17 @@ static void ble_app_advertise(void) {
 	adv_fields.name_len = strlen(device_name);
 	adv_fields.name_is_complete = 1;
 
+	adv_fields.tx_pwr_lvl_is_present = 1;
+	adv_fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
+
 	ble_gap_adv_set_fields(&adv_fields);
 
 	struct ble_gap_adv_params adv_params;
 	memset(&adv_params, 0, sizeof(adv_params));
 	adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
 	adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+	adv_params.itvl_min = 1600; // 1000ms (units of 0.625ms)
+	adv_params.itvl_max = 3200; // 2000ms
 	if (ble_gap_adv_start(g_ble_addr_type, NULL, BLE_HS_FOREVER, &adv_params, ble_gap_event,
 			      NULL) == 0) {
 		g_ble_advertising = true;
@@ -314,6 +316,16 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
 			g_ble_connected = true;
 			g_ble_conn_handle = event->connect.conn_handle;
 			g_ble_advertising = false;
+
+			// Request power-efficient connection parameters
+			struct ble_gap_upd_params conn_params = {
+				.itvl_min = 80,  // 100ms (units of 1.25ms)
+				.itvl_max = 160, // 200ms
+				.latency = 4,    // Skip up to 4 connection events
+				.supervision_timeout = 400, // 4s
+			};
+			ble_gap_update_params(g_ble_conn_handle, &conn_params);
+
 			if (g_ble_mon_task_handle == NULL) {
 				xTaskCreate(ble_monitor_task, "ble_mon_task", 2048, NULL, 5,
 					    &g_ble_mon_task_handle);
@@ -342,6 +354,11 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
 
 static void ble_app_on_sync(void) {
 	ble_hs_id_infer_auto(0, &g_ble_addr_type);
+
+	esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_N9);
+	esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_N9);
+	esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_SCAN, ESP_PWR_LVL_N9);
+
 	ble_app_advertise();
 }
 
@@ -350,57 +367,17 @@ static void ble_host_task(void *param) {
 	nimble_port_freertos_deinit();
 }
 
-// --- Hardware Control ---
-
-static void set_levels(void) {
-	uint32_t duty_max = (1 << 13) - 1;
-	uint32_t duty_l = 0, duty_r = 0, duty_s = 0;
-
-	if (g_state.state == STATE_PREHEAT) {
-		duty_l = duty_r = duty_s = duty_max;
-	} else if (g_state.state == STATE_RUNNING) {
-		// P-Control based on temperature
-		float temp_error = g_config.temp_setpoint - g_state.temperature;
-		float power = temp_error * (g_config.temp_proportional_gain / 100.0f);
-		power = fmaxf(0.0f, fminf(g_config.temp_max_power, power));
-
-		duty_s = (uint32_t)(duty_max * power * g_config.seat_factor);
-		duty_l = (uint32_t)(duty_max * power * g_config.grip_left_factor);
-		duty_r = (uint32_t)(duty_max * power * g_config.grip_right_factor);
-	}
-
-	ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_GRIP_L, duty_l);
-	ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_GRIP_L);
-	ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_GRIP_R, duty_r);
-	ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_GRIP_R);
-	ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_SEAT, duty_s);
-	ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_SEAT);
-	gpio_set_level(PIN_LED, g_state.state != STATE_PREHEAT && g_state.state != STATE_RUNNING);
-}
-
-static bool check_inhibit(uint32_t now) {
-	if (g_state.state == STATE_INHIBITED)
-		return false;
-
-	bool voltage_ok = g_state.voltage >=
-			  (g_config.voltage_threshold - g_config.voltage_hysteresis);
-	bool oil_ok = !g_config.oil_pressure_enabled || g_state.oil_pressure_ok;
-
-	if (!voltage_ok || !oil_ok) {
-		g_state.previous_state = g_state.state;
-		g_state.state = STATE_INHIBITED;
-		g_state.state_entry_time = now;
-		return true;
-	}
-
-	return false;
-}
-
 static void IRAM_ATTR oil_pressure_isr_handler(void *arg) {
 	g_state.oil_pressure_ok = gpio_get_level(PIN_OIL_PRESSURE) == 0;
-	if (check_inhibit(esp_timer_get_time())) {
-		set_levels();
-	}
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	vTaskNotifyGiveFromISR(g_state_task_handle, &xHigherPriorityTaskWoken);
+	portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+static void init_interrupts() {
+	gpio_install_isr_service(0);
+	gpio_isr_handler_add(PIN_OIL_PRESSURE, oil_pressure_isr_handler, NULL);
+	esp_sleep_enable_gpio_wakeup();
 }
 
 static bool init_hardware(void) {
@@ -413,8 +390,6 @@ static bool init_hardware(void) {
 				 .pull_up_en = 1,
 				 .intr_type = GPIO_INTR_ANYEDGE};
 	gpio_config(&io_conf);
-	gpio_install_isr_service(0);
-	gpio_isr_handler_add(PIN_OIL_PRESSURE, oil_pressure_isr_handler, NULL);
 
 	adc_oneshot_unit_handle_t handle;
 	adc_oneshot_unit_init_cfg_t init_config1 = {.unit_id = ADC_UNIT_1,
@@ -481,44 +456,140 @@ static bool init_hardware(void) {
 	return true;
 }
 
-static void update_sensors(void) {
-	int adc_raw;
-	if (adc_oneshot_read(adc_handle, PIN_VOLT_SENSE, &adc_raw) == ESP_OK) {
-		float v_pin = (adc_raw / 4095.0f) * 3.3f * 1.06f;
-		g_state.voltage =
-			(v_pin * ((VOLTAGE_DIVIDER_R1 + VOLTAGE_DIVIDER_R2) / VOLTAGE_DIVIDER_R2) *
-			 1.1325f);
-	}
-	g_state.oil_pressure_ok = gpio_get_level(PIN_OIL_PRESSURE) == 0;
-}
+static void voltage_task(void *pvParameters) {
+	while (1) {
+		int adc_raw;
+		int voltage = g_state.voltage;
+		if (adc_oneshot_read(adc_handle, PIN_VOLT_SENSE, &adc_raw) == ESP_OK) {
+			float v_pin = (adc_raw / 4095.0f) * 3.3f * 1.06f;
+			voltage =
+				(v_pin * ((VOLTAGE_DIVIDER_R1 + VOLTAGE_DIVIDER_R2) / VOLTAGE_DIVIDER_R2) *
+				1.1325f);
+		}
+		// Also read oil pressure for redundancy (ISR handles immediate changes)
+		bool oil_pressure_ok = gpio_get_level(PIN_OIL_PRESSURE) == 0;
+		if (oil_pressure_ok != g_state.oil_pressure_ok ||
+				voltage != g_state.voltage) {
+			g_state.voltage = voltage;
+			g_state.oil_pressure_ok = oil_pressure_ok;
+			xTaskNotifyGive(g_state_task_handle);
+		}
 
-// --- Sensor Tasks ---
+		vTaskDelay(pdMS_TO_TICKS(1000));
+	}
+}
 
 static void ds18b20_task(void *pvParameters) {
 	while (1) {
 		ds18b20_trigger_temperature_conversion(ds18b20_handle);
-		// Conversion takes up to 750ms
 		vTaskDelay(pdMS_TO_TICKS(800));
 		float temp;
-		if (ds18b20_get_temperature(ds18b20_handle, &temp) == ESP_OK) {
+		if (ds18b20_get_temperature(ds18b20_handle, &temp) == ESP_OK && temp != g_state.temperature) {
 			g_state.temperature = temp;
+			xTaskNotifyGive(g_state_task_handle);
 		}
-		vTaskDelay(pdMS_TO_TICKS(200));
+		vTaskDelay(pdMS_TO_TICKS(1200));
 	}
 }
 
-// --- Main State Machine Task ---
+static void set_levels(void) {
+	uint32_t duty_max = (1 << 13) - 1;
+	uint32_t duty_l = 0, duty_r = 0, duty_s = 0;
 
-static void state_machine_loop(void *pvParameters) {
-	TickType_t last_wake_time = xTaskGetTickCount();
+	if (g_state.state == STATE_PREHEAT) {
+		duty_l = duty_r = duty_s = duty_max;
+	} else if (g_state.state == STATE_RUNNING) {
+		// P-Control based on temperature
+		float temp_error = g_config.temp_setpoint - g_state.temperature;
+		float power = temp_error * (g_config.temp_proportional_gain / 100.0f);
+		power = fmaxf(0.0f, fminf(g_config.temp_max_power, power));
+
+		duty_s = (uint32_t)(duty_max * power * g_config.seat_factor);
+		duty_l = (uint32_t)(duty_max * power * g_config.grip_left_factor);
+		duty_r = (uint32_t)(duty_max * power * g_config.grip_right_factor);
+	}
+
+	ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_GRIP_L, duty_l);
+	ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_GRIP_L);
+	ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_GRIP_R, duty_r);
+	ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_GRIP_R);
+	ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_SEAT, duty_s);
+	ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_SEAT);
+	gpio_set_level(PIN_LED, g_state.state != STATE_PREHEAT && g_state.state != STATE_RUNNING);
+}
+
+static bool check_inhibit(uint32_t now) {
+	if (g_state.state == STATE_INHIBITED)
+		return false;
+
+	bool voltage_ok = g_state.voltage >=
+			  (g_config.voltage_threshold - g_config.voltage_hysteresis);
+	bool oil_ok = !g_config.oil_pressure_enabled || g_state.oil_pressure_ok;
+
+	if (!voltage_ok || !oil_ok) {
+		g_state.previous_state = g_state.state;
+		g_state.state = STATE_INHIBITED;
+		g_state.state_entry_time = now;
+		return true;
+	}
+
+	return false;
+}
+
+static TickType_t calculate_timeout(int64_t now) {
+	int64_t remaining_us;
+
+	switch (g_state.state) {
+	case STATE_WAIT_START_COND:
+		remaining_us = ((int64_t)g_config.start_delay_seconds * 1000000LL) -
+			       (now - g_state.state_entry_time);
+		if (remaining_us <= 0)
+			return 1;
+		return pdMS_TO_TICKS(remaining_us / 1000);
+
+	case STATE_PREHEAT:
+		remaining_us = ((int64_t)g_state.preheat_time_seconds * 1000000LL) -
+			       (now - g_state.state_entry_time);
+		if (remaining_us <= 0)
+			return 1;
+		return pdMS_TO_TICKS(remaining_us / 1000);
+
+	case STATE_RUNNING:
+		return portMAX_DELAY;
+
+	case STATE_INHIBITED:
+		remaining_us = INHIBIT_DEBOUNCE_US - (now - g_state.state_entry_time);
+		if (remaining_us <= 0)
+			return portMAX_DELAY;
+		return pdMS_TO_TICKS(remaining_us / 1000);
+
+	default:
+		return portMAX_DELAY;
+	}
+}
+
+static void state_machine_task(void *pvParameters) {
+	int64_t now = esp_timer_get_time();
+	g_state.state = STATE_WAIT_START_COND;
+	g_state.state_entry_time = now;
+
 	while (1) {
-		update_sensors();
-		int64_t now = esp_timer_get_time();
+		// Calculate timeout based on current state
+		TickType_t timeout = calculate_timeout(now);
+
+		// Block until notified by sensor task/ISR or timeout
+		ulTaskNotifyTake(pdTRUE, timeout);
+
+		// Update gpio_wakeup direction immediately after waking
+		// (ISR can't call this, so we do it here for quick response)
+		if (g_state.oil_pressure_ok) {
+			gpio_wakeup_enable(PIN_OIL_PRESSURE, GPIO_INTR_HIGH_LEVEL);
+		} else {
+			gpio_wakeup_enable(PIN_OIL_PRESSURE, GPIO_INTR_LOW_LEVEL);
+		}
+
+		now = esp_timer_get_time();
 		switch (g_state.state) {
-		case STATE_BOOT:
-			g_state.state = STATE_WAIT_START_COND;
-			g_state.state_entry_time = now;
-			break;
 		case STATE_WAIT_START_COND:
 			if (g_state.voltage >= g_config.voltage_threshold &&
 			    (!g_config.oil_pressure_enabled || g_state.oil_pressure_ok)) {
@@ -539,6 +610,7 @@ static void state_machine_loop(void *pvParameters) {
 				g_state.state_entry_time = now;
 			}
 			break;
+
 		case STATE_PREHEAT:
 			if ((now - g_state.state_entry_time) >
 			    (int64_t)g_state.preheat_time_seconds * 1000000LL) {
@@ -546,8 +618,10 @@ static void state_machine_loop(void *pvParameters) {
 				g_state.state_entry_time = now;
 			}
 			break;
+
 		case STATE_RUNNING:
 			break;
+
 		case STATE_INHIBITED:
 			if (g_state.voltage >= g_config.voltage_threshold &&
 			    (!g_config.oil_pressure_enabled || g_state.oil_pressure_ok)) {
@@ -563,8 +637,6 @@ static void state_machine_loop(void *pvParameters) {
 
 		check_inhibit(now);
 		set_levels();
-
-		vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(100));
 	}
 }
 
@@ -601,6 +673,9 @@ void app_main(void) {
 	ble_hs_cfg.sync_cb = ble_app_on_sync;
 	nimble_port_freertos_init(ble_host_task);
 
-	xTaskCreate(ds18b20_task, "temp_task", 2048, NULL, 5, NULL);
-	xTaskCreate(state_machine_loop, "control_task", 4096, NULL, 5, NULL);
+	xTaskCreate(state_machine_task, "state_task", 4096, NULL, 5, &g_state_task_handle);
+	xTaskCreate(voltage_task, "volt_task", 2048, NULL, 5, NULL);
+	xTaskCreate(ds18b20_task, "temp_task", 4096, NULL, 5, NULL);
+
+	init_interrupts();
 }

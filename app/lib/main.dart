@@ -582,7 +582,7 @@ class _ConfigPageState extends State<ConfigPage> {
 
   Widget _buildMonitoringPanel() {
     final m = _monitoringData ?? MonitoringData.empty();
-    final states = ["BOOT", "WAIT", "PREHEAT", "RUN", "INHIBIT"];
+    final states = ["WAIT", "PREHEAT", "RUN", "INHIBIT"];
     final stateStr = m.state < states.length ? states[m.state] : "OFFLINE";
     final voltColor = m.state == 0xFF
         ? Colors.white
