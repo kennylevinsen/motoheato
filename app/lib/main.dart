@@ -403,12 +403,14 @@ class _ConfigPageState extends State<ConfigPage> {
                               divisions: 19,
                             ),
                           ),
+                          Expanded(
+                            child: _buildMiniIntInput(
+                              "Start Delay (s)",
+                              _startDelaySeconds,
+                              (v) => setState(() => _startDelaySeconds = v),
+                            ),
+                          ),
                         ],
-                      ),
-                      _buildIntInput(
-                        "Start Delay (s)",
-                        _startDelaySeconds,
-                        (v) => setState(() => _startDelaySeconds = v),
                       ),
 
                       _buildSection("Temperature Curve"),
@@ -476,7 +478,7 @@ class _ConfigPageState extends State<ConfigPage> {
                             ),
                           ),
                           Expanded(
-                            child: _buildIntInput(
+                            child: _buildMiniIntInput(
                               "MAX (s)",
                               _preheatMaxTime,
                               (v) => setState(() => _preheatMaxTime = v),
@@ -601,21 +603,21 @@ class _ConfigPageState extends State<ConfigPage> {
               Expanded(child: _buildStat("STATE", stateStr, Colors.orange)),
               Expanded(
                 child: _buildStat(
-                  "OIL",
+                  "OIL PRESSURE",
                   m.oilPressureOk ? "OK" : "LOW",
                   m.oilPressureOk ? Colors.green : Colors.red,
                 ),
               ),
               Expanded(
                 child: _buildStat(
-                  "VOLT",
+                  "VOLTAGE",
                   "${m.voltage.toStringAsFixed(2)}V",
                   voltColor,
                 ),
               ),
               Expanded(
                 child: _buildStat(
-                  "TEMP",
+                  "TEMPERATURE",
                   "${m.temperature.toStringAsFixed(1)}°C",
                   tempColor,
                 ),
@@ -730,23 +732,25 @@ class _ConfigPageState extends State<ConfigPage> {
     );
   }
 
-  Widget _buildIntInput(String label, int value, ValueChanged<int> onChanged) {
-    return ListTile(
-      title: Text(label, style: const TextStyle(fontSize: 12)),
-      trailing: SizedBox(
-        width: 60,
-        child: TextFormField(
-          initialValue: value.toString(),
-          key: ValueKey("input_$label"),
-          keyboardType: TextInputType.number,
-          textAlign: TextAlign.end,
-          style: const TextStyle(fontSize: 12),
-          onChanged: (s) {
-            final parsed = int.tryParse(s);
-            if (parsed != null) onChanged(parsed);
-          },
+  Widget _buildMiniIntInput(String label, int value, ValueChanged<int> onChanged) {
+    return Column(
+      children: [
+        Text(label, style: const TextStyle(fontSize: 10, color: Colors.grey)),
+        Padding(
+          padding: EdgeInsets.only(bottom: 16.0, left: 8.0, right: 8.0),
+          child: TextFormField(
+            initialValue: value.toString(),
+            key: ValueKey("input_$label"),
+            keyboardType: TextInputType.number,
+            textAlign: TextAlign.end,
+            style: const TextStyle(fontSize: 12),
+            onChanged: (s) {
+              final parsed = int.tryParse(s);
+              if (parsed != null) onChanged(parsed);
+            },
+          ),
         ),
-      ),
+      ],
     );
   }
 }
