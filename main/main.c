@@ -459,7 +459,7 @@ static bool init_hardware(void) {
 static void voltage_task(void *pvParameters) {
 	while (1) {
 		int adc_raw;
-		int voltage = g_state.voltage;
+		float voltage = g_state.voltage;
 		if (adc_oneshot_read(adc_handle, PIN_VOLT_SENSE, &adc_raw) == ESP_OK) {
 			float v_pin = (adc_raw / 4095.0f) * 3.3f * 1.06f;
 			voltage =
